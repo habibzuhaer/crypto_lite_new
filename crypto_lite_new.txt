@@ -1,0 +1,30 @@
+crypto_lite_new/
+├── engine/
+│   ├── __init__.py
+│   ├── run_cycle.py        # единая точка входа
+│   ├── mtf_context.py     # MTF: bias / strength / state
+│   ├── stf_market.py      # STF: свечи, импульс, волатильность
+│   ├── margin_check.py    # маржинальные требования (ТОЛЬКО STF)
+│   ├── cme_gate.py        # CME hard-gate
+│   ├── scoring.py         # scoring (MTF + STF + CME)
+│   ├── levels_acdfxy.py   # ACDFXY (после всех pass)
+│   └── contract.py        # SignalContract
+│
+├── data/
+│   ├── futures_bybit.py   # как есть
+│   ├── candle_buffer.py   # окно 180
+│
+├── strategies/
+│   ├── final_candle.py    # выбор финальной свечи (твоя логика)
+│
+├── utils/
+│   ├── decimals.py
+│   └── timeframes.py
+│
+├── backtest/
+│   ├── simulate_trade.py
+│   └── compare_modes.py
+│
+└── diag/
+    ├── diag_flow.py
+    └── diag_contract.py
