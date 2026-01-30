@@ -1,0 +1,741 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import os, asyncio, logging, time, sys
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+from dotenv import load_dotenv
+import aiohttp
+
+# Загружаем переменные окружения
+load_dotenv()
+
+# Получаем переменные окружения
+TG_TOKEN = os.getenv('TG_TOKEN')
+TG_CHAT_ID = os.getenv('TG_CHAT_ID')
+
+if not TG_TOKEN:
+    logging.error("TG_TOKEN не установлен в переменных окружения")
+    sys.exit(1)
+
+if not TG_CHAT_ID:
+    logging.error("TG_CHAT_ID не установлен в переменных окружения")
+    sys.exit(1)
+
+# Настройка логгера СРАЗУ, чтобы видеть все ошибки
+logging.basicConfig(
+    level=logging.INFO, 
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("bot.log", encoding="utf-8")
+    ]
+)
+
+# Теперь импортируем остальные модули
+try:
+    from strategy_levels import (
+        calculate_levels, 
+        pick_biggest_candle,
+        calculate_rsi,
+        calculate_all_emas,
+        ema_trend_analysis,
+        detect_patterns,
+        calculate_levels_for_candle
+    )
+    from charting import plot_png
+    from tg import TelegramBot
+    from trend_detector import analyze_trend
+    from futures_bybit import fetch_kline
+    
+    # MarginZone модули - опционально
+    try:
+        from margin_integration import MarginZoneIntegrator, MarginZoneConfig
+        MARGINZONE_AVAILABLE = True
+        logging.info("✅ MarginZone модули загружены")
+    except ImportError as e:
+        logging.warning(f"MarginZone модули не доступны: {e}")
+        MARGINZONE_AVAILABLE = False
+        
+except ImportError as e:
+    logging.error(f"❌ Ошибка импорта модулей: {e}")
+    import traceback
+    logging.error(traceback.format_exc())
+    sys.exit(1)
+
+OUT_DIR = str(Path("out").resolve())
+Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
+
+# СЛОВАРЬ ПАР И ТАЙМФРЕЙМОВ
+SYMBOLS_TFS = {
+    "GRTUSDT": ["5m", "1h"],
+    "LINKUSDT": ["15m", "4h"],
+    "ADAUSDT": ["15m", "1h"],
+    "INJUSDT": ["15m", "1h"],
+}
+
+TF_MIN = {"5m": 5, "15m": 15, "1h": 60, "4h": 240}
+
+_last_state: Dict[str, str] = {}
+_last_sent_candle_ts: Dict[str, int] = {}
+_last_price: Dict[str, float] = {}
+_last_banner_ts: float = 0.0
+
+_break_mode: Dict[str, str] = {}
+_break_count: Dict[str, int] = {}
+_break_latched: Dict[str, bool] = {}
+_latched_on_ts: Dict[str, int] = {}
+_wait_new_candle: Dict[str, bool] = {}
+
+# Для отслеживания пробоев
+_last_breakout_time: Dict[str, int] = {}
+_current_levels: Dict[str, Dict[str, float]] = {}
+
+# MarginZone интегратор (глобальная переменная для доступа)
+_margin_integrator: Optional[MarginZoneIntegrator] = None
+
+def _key(symbol: str, tf: str) -> str:
+    return f"{symbol}|{tf}"
+
+def _state_signature(levels: Dict[str, float]) -> str:
+    """Создает уникальную сигнатуру для уровней."""
+    if not levels:
+        return ""
+    return "|".join(
+        f"{levels.get(k, 0):.8f}"
+        for k in ("X", "A", "C", "D", "F", "Y")
+    ) + f"|base={levels.get('_base_ts', 0)}"
+
+def _bars_24h(tf: str) -> int:
+    """Количество баров за 24 часа для данного ТФ."""
+    return max(1, (24 * 60) // TF_MIN.get(tf, 5))
+
+def _ts_to_human_str(ts_ms: int) -> str:
+    """Преобразует timestamp в читаемое время с указанием дня недели на русском."""
+    if ts_ms <= 0:
+        return "N/A"
+    
+    t = time.localtime(ts_ms // 1000)
+    days_ru = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    day_of_week = days_ru[t.tm_wday]
+    
+    return time.strftime(f"%d.%m.%Y {day_of_week} %H:%M", t)
+
+def _get_candle_time_range(candle: Dict, tf: str) -> Tuple[str, str]:
+    """Возвращает время открытия и закрытия свечи."""
+    ts_ms = int(candle.get("ts", 0))
+    if ts_ms <= 0:
+        return "N/A", "N/A"
+    
+    open_time = _ts_to_human_str(ts_ms)
+    
+    tf_duration_ms = {
+        "5m": 5 * 60 * 1000,
+        "15m": 15 * 60 * 1000,
+        "1h": 60 * 60 * 1000,
+        "4h": 4 * 60 * 60 * 1000
+    }
+    
+    close_ts = ts_ms + tf_duration_ms.get(tf, 60 * 60 * 1000)
+    close_time = _ts_to_human_str(close_ts)
+    
+    return open_time, close_time
+
+def _rsi_tag(rsi: Optional[float]) -> str:
+    """Форматирует RSI с эмодзи."""
+    if rsi is None:
+        return "—"
+    if rsi >= 70:
+        return f"{rsi:.1f} 🔴"
+    if rsi <= 30:
+        return f"{rsi:.1f} 🟢"
+    return f"{rsi:.1f} 🟡"
+
+def _format_ema_value(price: float, ema_value: Optional[float]) -> str:
+    """Форматирует значение EMA с указанием положения цены."""
+    if ema_value is None:
+        return "—"
+    
+    diff = price - ema_value
+    diff_percent = (diff / ema_value * 100) if ema_value != 0 else 0
+    
+    if diff > 0:
+        return f"{ema_value:.6f} ▲ (+{abs(diff_percent):.2f}%)"
+    elif diff < 0:
+        return f"{ema_value:.6f} ▼ ({diff_percent:.2f}%)"
+    else:
+        return f"{ema_value:.6f} ● (0.00%)"
+
+def _format_caption(
+    symbol: str, 
+    tf: str, 
+    candles: List[Dict], 
+    levels: Dict[str, float], 
+    rsi14: Optional[float],
+    emas: Dict[str, Optional[float]],
+    ema_analysis: Dict[str, any],
+    pats: List[str], 
+    trend_info: Optional[Dict]
+) -> str:
+    """Формирует подпись для Telegram с улучшенным форматированием."""
+    if not candles:
+        return f"❌ Нет данных для {symbol} {tf}"
+    
+    c = candles[-1]
+    price = float(c.get("close", 0.0))
+    
+    open_time, close_time = _get_candle_time_range(c, tf)
+    
+    main_levels = ["X", "F", "A", "C", "D", "Y"]
+    level_lines = []
+    for k in main_levels:
+        if k in levels:
+            level_lines.append(f"{k}: {levels[k]:.6f}")
+    
+    ema_display = []
+    for period in [8, 54, 78, 200]:
+        ema_key = f"EMA_{period}"
+        if ema_key in emas and emas[ema_key] is not None:
+            ema_display.append(f"EMA-{period}: {_format_ema_value(price, emas[ema_key])}")
+    
+    lines = [
+        f"📈 #{symbol} • Таймфрейм: {tf}</b>",
+        f"💰 Цена: {price:.6f}",
+        f"🕒 Время свечи: {open_time} - {close_time}",
+        f"📊 Проанализировано: {len(candles)} свечей",
+    ]
+    
+    if "_base_ts" in levels:
+        base_time = _ts_to_human_str(int(levels["_base_ts"]))
+        lines.append(f"🎯 Базовая свеча: {base_time}")
+    
+    if level_lines:
+        lines.append("\n🎯 Ключевые уровни:")
+        for i in range(0, len(level_lines), 2):
+            if i + 1 < len(level_lines):
+                lines.append(f"• {level_lines[i]} | {level_lines[i+1]}")
+            else:
+                lines.append(f"• {level_lines[i]}")
+    
+    if ema_display:
+        lines.append("\n📊 EMA индикаторы:")
+        for ema_line in ema_display:
+            lines.append(f"• {ema_line}")
+        
+        if ema_analysis and "trend" in ema_analysis and ema_analysis["trend"] != "неопределён":
+            trend_emoji = {
+                "сильный бычий": "📈📈",
+                "бычий": "📈",
+                "слабый бычий": "↗️",
+                "боковик": "➡️",
+                "слабый медвежий": "↘️",
+                "медвежий": "📉",
+                "сильный медвежий": "📉📉"
+            }.get(ema_analysis["trend"], "➖")
+            
+            lines.append(f"\n🎯 Тренд по EMA: {trend_emoji} {ema_analysis['trend']}")
+            lines.append(f"Сила тренда: {ema_analysis.get('strength', 0)}%")
+            
+            if ema_analysis.get("signals"):
+                signals_text = ", ".join(ema_analysis["signals"][:3])
+                lines.append(f"📶 Сигналы: {signals_text}")
+    
+    if pats:
+        lines.append(f"\n🎯 Паттерны:")
+        for pat in pats:
+            lines.append(f"• {pat}")
+    
+    lines.append(f"\n📊 RSI14: {_rsi_tag(rsi14)}")
+    
+    if trend_info and trend_info.get("trend") != "neutral":
+        trend_name = {"long": "📈 Бычий", "short": "📉 Медвежий"}.get(trend_info["trend"], "➖ Нейтральный")
+        conf = trend_info.get("confidence", 0) * 100
+        lines.append(f"🚀 Общий тренд: {trend_name} ({conf:.0f}%)")
+    
+    return "\n".join(lines)
+
+async def _fetch_with_retry(
+    sess: aiohttp.ClientSession, 
+    symbol: str, 
+    tf: str, 
+    limit: int = 250
+) -> Optional[List[Dict]]:
+    """Загрузка свечей с повторными попытками."""
+    for attempt, delay in enumerate([0, 1, 2, 4, 8], start=1):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            return await fetch_kline(sess, symbol, tf, limit=limit)
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+            logging.warning("[BYBIT] Попытка %s не удалась: %s", attempt, e)
+            if attempt == 5:
+                return None
+    return None
+
+def _check_breakout_and_recalculate(
+    candles: List[Dict],
+    current_levels: Dict[str, float],
+    current_price: float,
+    symbol: str,
+    tf: str,
+    key: str
+) -> Tuple[Dict[str, float], bool, str]:
+    """
+    Проверяет пробой уровней X/Y и пересчитывает уровни при необходимости.
+    """
+    x = current_levels.get("X")
+    y = current_levels.get("Y")
+    
+    if x is None or y is None:
+        return current_levels, False, "Отсутствуют уровни X/Y"
+    
+    upper_level = max(x, y)
+    lower_level = min(x, y)
+    
+    is_breakout = current_price > upper_level or current_price < lower_level
+    
+    if not is_breakout:
+        return current_levels, False, "Цена в пределах структуры"
+    
+    last_breakout = _last_breakout_time.get(key, 0)
+    current_time = int(time.time() * 1000)
+    cooldown = 5 * 60 * 1000
+    
+    if current_time - last_breakout < cooldown:
+        remaining = (cooldown - (current_time - last_breakout)) // 1000
+        return current_levels, False, f"Кулдаун активен ({remaining} сек)"
+    
+    if len(candles) < 50:
+        return current_levels, True, f"ПРОБОЙ! Недостаточно данных для поиска новой структуры (только {len(candles)} свечей)"
+    
+    logging.info(f"[BREAKOUT] Пробой структуры {symbol}/{tf}: цена={current_price:.6f}, X={x:.6f}, Y={y:.6f}")
+    
+    min_lookback = 190
+    lookback = min_lookback if len(candles) >= min_lookback else len(candles)
+    
+    search_start = -lookback
+    search_end = -5 if len(candles) > 5 else None
+    search_candles = candles[search_start:search_end] if search_end else candles[search_start:]
+    
+    if not search_candles:
+        search_candles = candles[-lookback:]
+    
+    logging.info(f"[BREAKOUT] Поиск в {len(search_candles)} свечах для {symbol}/{tf}")
+    
+    new_base = pick_biggest_candle(search_candles)
+    if not new_base:
+        new_base = pick_biggest_candle(candles[-100:]) if len(candles) >= 100 else pick_biggest_candle(candles)
+    
+    if not new_base:
+        return current_levels, True, f"ПРОБОЙ! Не удалось найти новую базовую свечу для {symbol}/{tf}"
+    
+    old_base_ts = current_levels.get("_base_ts")
+    same_base = False
+    
+    if old_base_ts and new_base.get("ts") == old_base_ts:
+        same_base = True
+        new_levels = current_levels
+        logging.info(f"[BREAKOUT] Базовая свеча та же для {symbol}/{tf}")
+    else:
+        new_levels = calculate_levels_for_candle(new_base)
+        new_levels["_base_ts"] = new_base["ts"]
+        new_levels["_base_open"] = new_base["open"]
+        new_levels["_base_high"] = new_base["high"]
+        new_levels["_base_low"] = new_base["low"]
+        new_levels["_base_close"] = new_base["close"]
+    
+    _last_breakout_time[key] = current_time
+    
+    direction = "ВВЕРХ" if current_price > upper_level else "ВНИЗ"
+    base_status = " (та же базовая свеча)" if same_base else " (новая базовая свеча)"
+    
+    if same_base:
+        description = (
+            f"🚨 ПРОБОЙ СТРУКТУРЫ {symbol} {tf}{base_status}\n"
+            f"Цена: {current_price:.6f} ({direction})\n"
+            f"Выход за: {(upper_level if direction == 'ВВЕРХ' else lower_level):.6f}\n"
+            f"Базовая свеча осталась прежней\n"
+            f"Текущие уровни: X={x:.6f}, Y={y:.6f}"
+        )
+    else:
+        description = (
+            f"🚨 ПРОБОЙ СТРУКТУРЫ {symbol} {tf}{base_status}\n"
+            f"Цена: {current_price:.6f} ({direction})\n"
+            f"Выход за: {(upper_level if direction == 'ВВЕРХ' else lower_level):.6f}\n"
+            f"Старые границы: {lower_level:.6f} - {upper_level:.6f}\n"
+            f"Новые уровни: X={new_levels.get('X', 0):.6f}, Y={new_levels.get('Y', 0):.6f}"
+        )
+    
+    logging.info(f"[BREAKOUT] {'Базовая свеча та же' if same_base else 'Новые уровни'} для {symbol}/{tf}")
+    
+    return new_levels, True, description
+
+def _update_break_state(
+    key: str, 
+    close_price: float, 
+    levels: Dict[str, float], 
+    curr_ts: int
+) -> None:
+    """Обновляет состояние пробоя уровней."""
+    x = levels.get("X")
+    y = levels.get("Y")
+    
+    if x is None or y is None:
+        _break_mode[key] = "inside"
+        _break_count[key] = 0
+        _break_latched[key] = False
+        _wait_new_candle[key] = False
+        _latched_on_ts[key] = -1
+        return
+    
+    if close_price > float(y):
+        mode = "aboveY"
+    elif close_price < float(x):
+        mode = "belowX"
+    else:
+        mode = "inside"
+    
+    prev_mode = _break_mode.get(key, "inside")
+    
+    if mode == "inside":
+        _break_mode[key] = "inside"
+        _break_count[key] = 0
+        _break_latched[key] = False
+        _wait_new_candle[key] = False
+        _latched_on_ts[key] = -1
+        return
+    
+    if mode == prev_mode:
+        _break_count[key] = _break_count.get(key, 0) + 1
+    else:
+        _break_mode[key] = mode
+        _break_count[key] = 1
+    
+    if _break_count[key] >= 6:
+        if not _break_latched.get(key, False):
+            _latched_on_ts[key] = curr_ts
+        _break_latched[key] = True
+        _wait_new_candle[key] = True
+
+async def run_symbol_tf(
+    sess: aiohttp.ClientSession, 
+    tg: TelegramBot,
+    symbol: str, 
+    tf: str
+) -> bool:
+    """Обрабатывает одну пару символ/ТФ."""
+    key = _key(symbol, tf)
+    
+    try:
+        # 1. Загружаем свечи
+        candles = await _fetch_with_retry(sess, symbol, tf, 250)
+        if not candles:
+            logging.warning("[WARN] Нет свечей для %s/%s", symbol, tf)
+            return False
+        
+        # 2. Обрабатываем свечи через MarginZoneEngine (если инициализирован)
+        if _margin_integrator and MARGINZONE_AVAILABLE:
+            try:
+                # ВАЖНО: нужно await!
+                await _margin_integrator.process_candles(symbol, tf, candles)
+            except Exception as e:
+                logging.error(f"[MarginZone] Ошибка обработки {symbol}/{tf}: {e}")
+                import traceback
+                logging.error(traceback.format_exc())
+        
+        c_last = candles[-1]
+        curr_price = float(c_last.get("close", 0))
+        curr_ts = int(c_last.get("ts", 0))
+        
+        # 3. Проверяем, не отправляли ли уже эту свечу
+        if _last_sent_candle_ts.get(key) == curr_ts:
+            return False
+        
+        # 4. Получаем текущие уровни или рассчитываем новые
+        current_levels = _current_levels.get(key)
+        need_send_message = False
+        breakout_description = ""
+        breakout_detected = False
+        
+        if not current_levels:
+            current_levels = calculate_levels(candles, symbol, tf, use_biggest_from_last=240)
+            if not current_levels:
+                logging.warning("[WARN] Не удалось расчитать уровни для %s/%s", symbol, tf)
+                return False
+            _current_levels[key] = current_levels
+            need_send_message = True
+        else:
+            new_levels, should_send, description = _check_breakout_and_recalculate(
+                candles, current_levels, curr_price, symbol, tf, key
+            )
+            
+            breakout_description = description
+            breakout_detected = "ПРОБОЙ" in description
+            
+            if breakout_detected:
+                if new_levels and new_levels != current_levels:
+                    current_levels = new_levels
+                    _current_levels[key] = current_levels
+                
+                need_send_message = True
+                
+                _break_mode[key] = "inside"
+                _break_count[key] = 0
+                _break_latched[key] = False
+                _wait_new_candle[key] = False
+                _latched_on_ts[key] = -1
+        
+        # 5. Добавляем timestamp базовой свечи
+        base = pick_biggest_candle(candles[-240:])
+        if base and "ts" in base:
+            current_levels["_base_ts"] = base["ts"]
+        
+        # 6. Определяем паттерны
+        lookback = min(len(candles), _bars_24h(tf))
+        pats = detect_patterns(candles[-lookback:])
+        
+        # 7. Рассчитываем RSI
+        rsi14 = calculate_rsi(candles)
+        
+        # 8. Рассчитываем EMA
+        emas = calculate_all_emas(candles)
+        ema_analysis = ema_trend_analysis(emas, curr_price)
+        
+        # 9. Анализ тренда
+        trend_info = None
+        if tf in ["5m", "15m", "1h"]:
+            tf_map = {"5m": "15m", "15m": "1h", "1h": "4h", "4h": "4h"}
+            tf_higher = tf_map.get(tf, tf)
+            
+            candles_higher = await _fetch_with_retry(sess, symbol, tf_higher, 120)
+            if candles_higher:
+                try:
+                    trend_info = analyze_trend(candles, candles_higher)
+                except Exception as e:
+                    logging.warning("[TREND] Ошибка анализа тренда: %s", e)
+                    trend_info = None
+        
+        # 10. Обновляем состояние пробоя
+        _update_break_state(key, curr_price, current_levels, curr_ts)
+        
+        latched = _break_latched.get(key, False)
+        latched_ts = _latched_on_ts.get(key, -1)
+        need_new = _wait_new_candle.get(key, False)
+        
+        # 11. Проверяем условия для отправки
+        should_send = (
+            latched and 
+            need_new and 
+            curr_ts != latched_ts and 
+            curr_ts > latched_ts >= 0
+        ) or need_send_message
+        
+        if not should_send:
+            _last_price[key] = curr_price
+            return False
+        
+        # 12. Проверяем, не отправляли ли уже эти уровни
+        state = _state_signature(current_levels)
+        if _last_state.get(key) == state and not need_send_message:
+            _last_price[key] = curr_price
+            return False
+        
+        # 13. Генерируем график
+        img_path = os.path.join(OUT_DIR, f"{symbol}_{tf}_{int(time.time())}.png")
+        try:
+            title = f"{symbol} {tf}"
+            if rsi14:
+                title += f"  RSI={rsi14:.1f}"
+            
+            if breakout_detected:
+                title += " [ПРОБОЙ]"
+                if "та же базовая свеча" in breakout_description:
+                    title += " (та же база)"
+                else:
+                    title += " (новая структура)"
+            
+            os.makedirs(os.path.dirname(img_path), exist_ok=True)
+            
+            plot_png(candles, current_levels, img_path, title=title)
+            
+            if not os.path.exists(img_path) or os.path.getsize(img_path) < 1000:
+                logging.error("[CHART] Не удалось создать график для %s/%s", symbol, tf)
+                return False
+                
+        except Exception as e:
+            logging.error("[CHART] Ошибка построения графика: %s", e)
+            return False
+        
+        # 14. Формируем и отправляем сообщение
+        cap = _format_caption(symbol, tf, candles, current_levels, rsi14, emas, ema_analysis, pats, trend_info)
+        
+        if breakout_description and "ПРОБОЙ" in breakout_description:
+            cap = f"🚨 {breakout_description}\n\n{cap}"
+        
+        logging.info(f"Отправка фото для {symbol}/{tf}")
+        
+        ok = await tg.send_photo(img_path, cap)
+        
+        if ok:
+            _last_state[key] = state
+            _last_sent_candle_ts[key] = curr_ts
+            _last_price[key] = curr_price
+            _wait_new_candle[key] = False
+            logging.info("[SENT] Успешно отправлено %s/%s", symbol, tf)
+            return True
+        else:
+            logging.error("[TG] Не удалось отправить сообщение для %s/%s", symbol, tf)
+            return False
+        
+    except Exception as e:
+        logging.error("[ERROR] %s/%s: %s", symbol, tf, e)
+        import traceback
+        logging.error(traceback.format_exc())
+        return False
+
+async def main_loop() -> None:
+    """Основной цикл бота."""
+    global _last_banner_ts, _margin_integrator
+    
+    logging.info("=" * 60)
+    logging.info("🚀 Бот запускается...")
+    logging.info(f"Python: {sys.version}")
+    logging.info(f"Working Directory: {os.getcwd()}")
+    logging.info(f"MarginZone доступен: {MARGINZONE_AVAILABLE}")
+    logging.info("=" * 60)
+    
+    # Инициализируем Telegram бота
+    try:
+        tg = TelegramBot(TG_TOKEN, TG_CHAT_ID)
+        logging.info("✅ Telegram бот инициализирован")
+    except Exception as e:
+        logging.error(f"❌ Ошибка инициализации Telegram бота: {e}")
+        import traceback
+        logging.error(traceback.format_exc())
+        return
+    
+    # Инициализируем HTTP сессию
+    try:
+        sess = aiohttp.ClientSession()
+        logging.info("✅ HTTP сессия создана")
+    except Exception as e:
+        logging.error(f"❌ Ошибка создания HTTP сессии: {e}")
+        import traceback
+        logging.error(traceback.format_exc())
+        return
+    
+    # Инициализируем MarginZoneIntegrator (если доступен)
+    if MARGINZONE_AVAILABLE:
+        try:
+            _margin_integrator = MarginZoneIntegrator(telegram_client=tg)
+            logging.info("✅ MarginZoneIntegrator инициализирован")
+            
+            # Добавляем символы для мониторинга MarginZone
+            for symbol, tfs in SYMBOLS_TFS.items():
+                for tf in tfs:
+                    config = MarginZoneConfig(
+                        impulse_atr_mult=1.8,
+                        zone_width_atr=0.5,
+                        max_zone_lifetime=100
+                    )
+                    _margin_integrator.add_symbol(symbol, tf, config)
+            
+            logging.info(f"✅ Добавлено {len(SYMBOLS_TFS)} символов в MarginZone")
+            
+        except Exception as e:
+            logging.error(f"❌ Ошибка инициализации MarginZoneIntegrator: {e}")
+            import traceback
+            logging.error(traceback.format_exc())
+            _margin_integrator = None
+    else:
+        logging.warning("⚠️  MarginZoneIntegrator не доступен, работаем без него")
+        _margin_integrator = None
+    
+    TF_SLEEP = 60
+    error_count = 0
+    max_errors = 5
+    
+    logging.info("🚀 Основной цикл начат")
+    
+    try:
+        while error_count < max_errors:
+            sent_count = 0
+            start_time = time.time()
+            
+            try:
+                for symbol, tfs in SYMBOLS_TFS.items():
+                    for tf in tfs:
+                        try:
+                            if await run_symbol_tf(sess, tg, symbol, tf):
+                                sent_count += 1
+                            await asyncio.sleep(0.1)
+                        except Exception as e:
+                            logging.error(f"Ошибка обработки {symbol}/{tf}: {e}")
+                            error_count += 1
+                
+                now = time.time()
+                if sent_count > 0 and (now - _last_banner_ts) >= 1800:
+                    banner_text = "📊 <b>Market Monitor Active</b>\n"
+                    banner_text += f"Обработано пар: {len(SYMBOLS_TFS)}\n"
+                    banner_text += f"Отправлено сигналов: {sent_count}"
+                    if _margin_integrator:
+                        banner_text += f"\nMarginZone активен: {len(_margin_integrator.get_active_zones())} зон"
+                    
+                    if await tg.send_message(banner_text):
+                        _last_banner_ts = now
+                        logging.info("[BANNER] Отправлен баннер")
+                
+                # Сброс счетчика ошибок при успешной итерации
+                if sent_count > 0:
+                    error_count = 0
+                
+                loop_time = time.time() - start_time
+                if loop_time > TF_SLEEP:
+                    logging.warning("[PERF] Цикл занял %.2fс (дольше чем интервал %dс)", 
+                                  loop_time, TF_SLEEP)
+                
+                sleep_time = max(1, TF_SLEEP - loop_time)
+                await asyncio.sleep(sleep_time)
+                
+            except Exception as e:
+                logging.error(f"❌ Ошибка в основном цикле: {e}")
+                import traceback
+                logging.error(traceback.format_exc())
+                error_count += 1
+                await asyncio.sleep(30)
+        
+        logging.error(f"🛑 Достигнут максимум ошибок ({max_errors}), бот останавливается")
+        
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        logging.info("🛑 Бот остановлен по запросу")
+    except Exception as e:
+        logging.error(f"❌ Критическая ошибка: {e}")
+        import traceback
+        logging.error(traceback.format_exc())
+    finally:
+        # Корректное завершение
+        try:
+            await sess.close()
+            logging.info("✅ HTTP сессия закрыта")
+        except:
+            pass
+            
+        if _margin_integrator:
+            try:
+                _margin_integrator.close()
+                logging.info("✅ MarginZoneIntegrator закрыт")
+            except:
+                pass
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main_loop())
+    except KeyboardInterrupt:
+        print("\n🛑 Бот остановлен пользователем")
+        sys.exit(0)
+    except Exception as e:
+        logging.error(f"❌ Критическая ошибка при запуске: {e}")
+        import traceback
+        logging.error(traceback.format_exc())
+        sys.exit(1)
