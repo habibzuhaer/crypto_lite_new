@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os, asyncio, logging, time, sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 from dotenv import load_dotenv
 import aiohttp
@@ -49,9 +49,9 @@ try:
     from trend_detector import analyze_trend
     from futures_bybit import fetch_kline
     
-    # MarginZone модули - опционально
+    # MarginZone модули
     try:
-        from margin_integration import MarginZoneIntegrator, MarginZoneConfig
+        from margin_zone_engine import find_margin_zones
         MARGINZONE_AVAILABLE = True
         logging.info("✅ MarginZone модули загружены")
     except ImportError as e:
@@ -67,6 +67,14 @@ except ImportError as e:
 OUT_DIR = str(Path("out").resolve())
 Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
 
+# ============================================================================
+# КОНФИГУРАЦИЯ СИСТЕМЫ
+# ============================================================================
+
+# Группы таймфреймов согласно требованиям
+MTF_GROUP = ["5m", "15m"]   # Среднесрочные: только уровни
+STF_GROUP = ["1h", "4h"]    # Краткосрочные: уровни, зоны и совпадения
+
 # СЛОВАРЬ ПАР И ТАЙМФРЕЙМОВ
 SYMBOLS_TFS = {
     "GRTUSDT": ["5m", "1h"],
@@ -77,7 +85,20 @@ SYMBOLS_TFS = {
 
 TF_MIN = {"5m": 5, "15m": 15, "1h": 60, "4h": 240}
 
+# Параметры для маржинальных зон
+ZONES_ATR_MULTIPLIER = 1.8
+ZONES_CONSOLIDATION_BARS = 5
+ZONES_MIN_WIDTH_PERCENT = 0.05
+COLLISION_THRESHOLD_PERCENT = 0.105  # Порог совпадения 0.105%
+
+# ============================================================================
+# ГЛОБАЛЬНЫЕ СОСТОЯНИЯ
+# ============================================================================
+
+# Состояния для уровней, зон и совпадений
 _last_state: Dict[str, str] = {}
+_last_zones_state: Dict[str, str] = {}
+_last_collisions_state: Dict[str, str] = {}
 _last_sent_candle_ts: Dict[str, int] = {}
 _last_price: Dict[str, float] = {}
 _last_banner_ts: float = 0.0
@@ -92,8 +113,14 @@ _wait_new_candle: Dict[str, bool] = {}
 _last_breakout_time: Dict[str, int] = {}
 _current_levels: Dict[str, Dict[str, float]] = {}
 
-# MarginZone интегратор (глобальная переменная для доступа)
-_margin_integrator: Optional[MarginZoneIntegrator] = None
+# Для хранения уровней, зон и совпадений
+_levels_data: Dict[str, List[float]] = {}
+_zones_data: Dict[str, List[Dict]] = {}
+_collisions_data: Dict[str, List[Dict]] = {}
+
+# ============================================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ============================================================================
 
 def _key(symbol: str, tf: str) -> str:
     return f"{symbol}|{tf}"
@@ -106,6 +133,24 @@ def _state_signature(levels: Dict[str, float]) -> str:
         f"{levels.get(k, 0):.8f}"
         for k in ("X", "A", "C", "D", "F", "Y")
     ) + f"|base={levels.get('_base_ts', 0)}"
+
+def _zones_signature(zones: List[Dict]) -> str:
+    """Создает уникальную сигнатуру для маржинальных зон."""
+    if not zones:
+        return "no_zones"
+    return "|".join(
+        f"{zone.get('low', 0):.8f}-{zone.get('high', 0):.8f}"
+        for zone in zones[:5]  # Берем первые 5 зон
+    )
+
+def _collisions_signature(collisions: List[Dict]) -> str:
+    """Создает уникальную сигнатуру для совпадений."""
+    if not collisions:
+        return "no_collisions"
+    return "|".join(
+        f"{collision.get('level', 0):.8f}-{collision.get('zone_low', 0):.8f}-{collision.get('zone_high', 0):.8f}"
+        for collision in collisions[:5]  # Берем первые 5 совпадений
+    )
 
 def _bars_24h(tf: str) -> int:
     """Количество баров за 24 часа для данного ТФ."""
@@ -200,7 +245,7 @@ def _format_caption(
             ema_display.append(f"EMA-{period}: {_format_ema_value(price, emas[ema_key])}")
     
     lines = [
-        f"📈 #{symbol} • Таймфрейм: {tf}</b>",
+        f"📈 #{symbol} • Таймфрейм: {tf}",
         f"💰 Цена: {price:.6f}",
         f"🕒 Время свечи: {open_time} - {close_time}",
         f"📊 Проанализировано: {len(candles)} свечей",
@@ -254,6 +299,53 @@ def _format_caption(
         lines.append(f"🚀 Общий тренд: {trend_name} ({conf:.0f}%)")
     
     return "\n".join(lines)
+
+def check_collisions(levels: List[float], zones: List[Dict], current_price: float) -> List[Dict]:
+    """
+    Проверяет совпадения уровней с маржинальными зонами.
+    Возвращает список словарей с информацией о совпадениях.
+    """
+    collisions = []
+    
+    if not levels or not zones:
+        return collisions
+    
+    for level in levels:
+        for zone in zones:
+            zone_low = zone.get('low', 0)
+            zone_high = zone.get('high', 0)
+            
+            # Расширяем границы зоны на порог совпадения (0.105%)
+            lower_bound = zone_low * (1 - COLLISION_THRESHOLD_PERCENT / 100)
+            upper_bound = zone_high * (1 + COLLISION_THRESHOLD_PERCENT / 100)
+            
+            # Проверяем, находится ли уровень внутри расширенной зоны
+            if lower_bound <= level <= upper_bound:
+                # Вычисляем расстояние до центра зоны
+                zone_center = (zone_low + zone_high) / 2
+                distance_to_center = abs(level - zone_center)
+                distance_percent = (distance_to_center / zone_center) * 100 if zone_center != 0 else 0
+                
+                # Определяем позицию относительно зоны
+                if level < zone_low:
+                    position = "ниже зоны"
+                elif level > zone_high:
+                    position = "выше зоны"
+                else:
+                    position = "внутри зоны"
+                
+                collisions.append({
+                    'level': level,
+                    'zone_low': zone_low,
+                    'zone_high': zone_high,
+                    'zone_center': zone_center,
+                    'distance_percent': distance_percent,
+                    'position': position,
+                    'zone_strength': zone.get('strength', 0)
+                })
+                break  # Каждый уровень может совпадать только с одной зоной
+    
+    return collisions
 
 async def _fetch_with_retry(
     sess: aiohttp.ClientSession, 
@@ -418,6 +510,151 @@ def _update_break_state(
         _break_latched[key] = True
         _wait_new_candle[key] = True
 
+async def _send_levels_message(
+    tg: TelegramBot,
+    symbol: str,
+    tf: str,
+    candles: List[Dict],
+    current_levels: Dict[str, float],
+    current_price: float,
+    rsi14: Optional[float],
+    emas: Dict[str, Optional[float]],
+    ema_analysis: Dict[str, any],
+    pats: List[str],
+    trend_info: Optional[Dict],
+    breakout_description: str = ""
+) -> bool:
+    """Отправляет сообщение с уровнями и графиком."""
+    try:
+        # Генерируем график
+        img_path = os.path.join(OUT_DIR, f"{symbol}_{tf}_{int(time.time())}.png")
+        
+        title = f"{symbol} {tf}"
+        if rsi14:
+            title += f"  RSI={rsi14:.1f}"
+        
+        os.makedirs(os.path.dirname(img_path), exist_ok=True)
+        
+        plot_png(candles, current_levels, img_path, title=title)
+        
+        if not os.path.exists(img_path) or os.path.getsize(img_path) < 1000:
+            logging.error("[CHART] Не удалось создать график для %s/%s", symbol, tf)
+            return False
+        
+        # Формируем подпись
+        cap = _format_caption(symbol, tf, candles, current_levels, rsi14, emas, ema_analysis, pats, trend_info)
+        
+        if breakout_description and "ПРОБОЙ" in breakout_description:
+            cap = f"🚨 {breakout_description}\n\n{cap}"
+        
+        logging.info(f"Отправка фото для {symbol}/{tf}")
+        
+        ok = await tg.send_photo(img_path, cap)
+        
+        return ok
+        
+    except Exception as e:
+        logging.error("[CHART] Ошибка построения графика: %s", e)
+        return False
+
+async def _send_zones_message(
+    tg: TelegramBot,
+    symbol: str,
+    tf: str,
+    zones: List[Dict],
+    current_price: float
+) -> bool:
+    """Отправляет сообщение о маржинальных зонах."""
+    if not zones:
+        return False
+    
+    # Сортируем зоны по средней точке
+    sorted_zones = sorted(zones, key=lambda z: (z.get('high', 0) + z.get('low', 0)) / 2)
+    
+    message = f"""
+🎯 *Маржинальные зоны {symbol} | {tf}*
+──────────────────────
+💰 Текущая цена: `{current_price:.6f}`
+
+📏 *Обнаруженные зоны ликвидности:*
+"""
+    
+    for i, zone in enumerate(sorted_zones, 1):
+        zone_low = zone.get('low', 0)
+        zone_high = zone.get('high', 0)
+        zone_mid = (zone_low + zone_high) / 2
+        zone_width_percent = ((zone_high - zone_low) / zone_mid) * 100
+        
+        # Определяем положение зоны относительно текущей цены
+        if current_price > zone_high:
+            position = "🔴 Выше цены"
+        elif current_price < zone_low:
+            position = "🟢 Ниже цены"
+        else:
+            position = "🟡 Цена ВНУТРИ зоны!"
+        
+        message += f"""
+{i}. *Диапазон:* `{zone_low:.6f}` - `{zone_high:.6f}`
+   *Средняя:* `{zone_mid:.6f}`
+   *Ширина:* {zone_width_percent:.2f}%
+   *Положение:* {position}
+"""
+    
+    message += f"""
+──────────────────────
+📊 Всего зон: {len(zones)}
+⏰ {time.strftime('%H:%M:%S')}
+"""
+    
+    return await tg.send_message(message)
+
+async def _send_collisions_message(
+    tg: TelegramBot,
+    symbol: str,
+    tf: str,
+    collisions: List[Dict],
+    current_price: float
+) -> bool:
+    """Отправляет специальное сообщение о совпадениях с желтым треугольником."""
+    if not collisions:
+        return False
+    
+    message = f"""
+⚠️ *СОВПАДЕНИЕ УРОВНЕЙ И ЗОН! {symbol} | {tf}*
+──────────────────────
+💰 Текущая цена: `{current_price:.6f}`
+
+🎯 *Обнаруженные совпадения:*
+"""
+    
+    for i, collision in enumerate(collisions, 1):
+        level = collision.get('level', 0)
+        zone_low = collision.get('zone_low', 0)
+        zone_high = collision.get('zone_high', 0)
+        zone_center = collision.get('zone_center', 0)
+        position = collision.get('position', '')
+        distance_percent = collision.get('distance_percent', 0)
+        
+        message += f"""
+{i}. *Уровень:* `{level:.6f}`
+   *Зона:* `{zone_low:.6f}` - `{zone_high:.6f}`
+   *Позиция:* {position}
+   *Расстояние до центра:* {distance_percent:.3f}%
+   *Сила зоны:* {collision.get('zone_strength', 0):.1f}
+"""
+    
+    message += f"""
+──────────────────────
+💡 *Интерпретация:*
+Совпадение технических уровней с маржинальными зонами 
+указывает на области повышенной ликвидности, 
+где вероятны сильные движения цены.
+
+⏰ {time.strftime('%H:%M:%S')}
+"""
+    
+    return await tg.send_message(message)
+
 async def run_symbol_tf(
     sess: aiohttp.ClientSession, 
     tg: TelegramBot,
@@ -426,6 +663,7 @@ async def run_symbol_tf(
 ) -> bool:
     """Обрабатывает одну пару символ/ТФ."""
     key = _key(symbol, tf)
+    sent_messages = 0
     
     try:
         # 1. Загружаем свечи
@@ -434,25 +672,16 @@ async def run_symbol_tf(
             logging.warning("[WARN] Нет свечей для %s/%s", symbol, tf)
             return False
         
-        # 2. Обрабатываем свечи через MarginZoneEngine (если инициализирован)
-        if _margin_integrator and MARGINZONE_AVAILABLE:
-            try:
-                # ВАЖНО: нужно await!
-                await _margin_integrator.process_candles(symbol, tf, candles)
-            except Exception as e:
-                logging.error(f"[MarginZone] Ошибка обработки {symbol}/{tf}: {e}")
-                import traceback
-                logging.error(traceback.format_exc())
-        
         c_last = candles[-1]
         curr_price = float(c_last.get("close", 0))
         curr_ts = int(c_last.get("ts", 0))
         
-        # 3. Проверяем, не отправляли ли уже эту свечу
+        # 2. Проверяем, не отправляли ли уже эту свечу (для уровней)
         if _last_sent_candle_ts.get(key) == curr_ts:
-            return False
+            # Проверяем только для уровней, зоны могут обновляться независимо
+            pass
         
-        # 4. Получаем текущие уровни или рассчитываем новые
+        # 3. Получаем текущие уровни или рассчитываем новые
         current_levels = _current_levels.get(key)
         need_send_message = False
         breakout_description = ""
@@ -486,23 +715,23 @@ async def run_symbol_tf(
                 _wait_new_candle[key] = False
                 _latched_on_ts[key] = -1
         
-        # 5. Добавляем timestamp базовой свечи
+        # 4. Добавляем timestamp базовой свечи
         base = pick_biggest_candle(candles[-240:])
         if base and "ts" in base:
             current_levels["_base_ts"] = base["ts"]
         
-        # 6. Определяем паттерны
+        # 5. Определяем паттерны
         lookback = min(len(candles), _bars_24h(tf))
         pats = detect_patterns(candles[-lookback:])
         
-        # 7. Рассчитываем RSI
+        # 6. Рассчитываем RSI
         rsi14 = calculate_rsi(candles)
         
-        # 8. Рассчитываем EMA
+        # 7. Рассчитываем EMA
         emas = calculate_all_emas(candles)
         ema_analysis = ema_trend_analysis(emas, curr_price)
         
-        # 9. Анализ тренда
+        # 8. Анализ тренда
         trend_info = None
         if tf in ["5m", "15m", "1h"]:
             tf_map = {"5m": "15m", "15m": "1h", "1h": "4h", "4h": "4h"}
@@ -516,77 +745,109 @@ async def run_symbol_tf(
                     logging.warning("[TREND] Ошибка анализа тренда: %s", e)
                     trend_info = None
         
-        # 10. Обновляем состояние пробоя
+        # 9. Обновляем состояние пробоя
         _update_break_state(key, curr_price, current_levels, curr_ts)
         
         latched = _break_latched.get(key, False)
         latched_ts = _latched_on_ts.get(key, -1)
         need_new = _wait_new_candle.get(key, False)
         
-        # 11. Проверяем условия для отправки
-        should_send = (
+        # 10. Проверяем условия для отправки уровней
+        should_send_levels = (
             latched and 
             need_new and 
             curr_ts != latched_ts and 
             curr_ts > latched_ts >= 0
         ) or need_send_message
         
-        if not should_send:
-            _last_price[key] = curr_price
-            return False
-        
-        # 12. Проверяем, не отправляли ли уже эти уровни
+        # 11. Проверяем, не отправляли ли уже эти уровни
         state = _state_signature(current_levels)
         if _last_state.get(key) == state and not need_send_message:
-            _last_price[key] = curr_price
-            return False
-        
-        # 13. Генерируем график
-        img_path = os.path.join(OUT_DIR, f"{symbol}_{tf}_{int(time.time())}.png")
-        try:
-            title = f"{symbol} {tf}"
-            if rsi14:
-                title += f"  RSI={rsi14:.1f}"
-            
-            if breakout_detected:
-                title += " [ПРОБОЙ]"
-                if "та же базовая свеча" in breakout_description:
-                    title += " (та же база)"
-                else:
-                    title += " (новая структура)"
-            
-            os.makedirs(os.path.dirname(img_path), exist_ok=True)
-            
-            plot_png(candles, current_levels, img_path, title=title)
-            
-            if not os.path.exists(img_path) or os.path.getsize(img_path) < 1000:
-                logging.error("[CHART] Не удалось создать график для %s/%s", symbol, tf)
-                return False
-                
-        except Exception as e:
-            logging.error("[CHART] Ошибка построения графика: %s", e)
-            return False
-        
-        # 14. Формируем и отправляем сообщение
-        cap = _format_caption(symbol, tf, candles, current_levels, rsi14, emas, ema_analysis, pats, trend_info)
-        
-        if breakout_description and "ПРОБОЙ" in breakout_description:
-            cap = f"🚨 {breakout_description}\n\n{cap}"
-        
-        logging.info(f"Отправка фото для {symbol}/{tf}")
-        
-        ok = await tg.send_photo(img_path, cap)
-        
-        if ok:
-            _last_state[key] = state
-            _last_sent_candle_ts[key] = curr_ts
-            _last_price[key] = curr_price
-            _wait_new_candle[key] = False
-            logging.info("[SENT] Успешно отправлено %s/%s", symbol, tf)
-            return True
+            # Уровни не изменились
+            should_send_levels = False
         else:
-            logging.error("[TG] Не удалось отправить сообщение для %s/%s", symbol, tf)
-            return False
+            # Сохраняем уровни
+            level_values = [current_levels.get(k) for k in ["X", "A", "C", "D", "F", "Y"] 
+                           if current_levels.get(k) is not None]
+            _levels_data[key] = level_values
+        
+        # 12. ОБРАБОТКА ДЛЯ РАЗНЫХ ГРУПП ТАЙМФРЕЙМОВ
+        if tf in MTF_GROUP:
+            # ТОЛЬКО для MTF: отправляем только уровни
+            if should_send_levels:
+                ok = await _send_levels_message(
+                    tg, symbol, tf, candles, current_levels, curr_price,
+                    rsi14, emas, ema_analysis, pats, trend_info, breakout_description
+                )
+                if ok:
+                    _last_state[key] = state
+                    _last_sent_candle_ts[key] = curr_ts
+                    _last_price[key] = curr_price
+                    _wait_new_candle[key] = False
+                    sent_messages += 1
+                    logging.info("[MTF] Уровни отправлены для %s/%s", symbol, tf)
+        
+        elif tf in STF_GROUP:
+            # ДЛЯ STF: уровни + маржинальные зоны + совпадения
+            
+            # A) Получаем маржинальные зоны (только для STF)
+            current_zones = []
+            if MARGINZONE_AVAILABLE:
+                try:
+                    current_zones = find_margin_zones(
+                        candles=candles,
+                        atr_multiplier=ZONES_ATR_MULTIPLIER,
+                        consolidation_bars=ZONES_CONSOLIDATION_BARS,
+                        min_zone_width_percent=ZONES_MIN_WIDTH_PERCENT
+                    )
+                    _zones_data[key] = current_zones
+                except Exception as e:
+                    logging.error(f"[MarginZone] Ошибка получения зон {symbol}/{tf}: {e}")
+            
+            # B) Проверяем совпадения уровней с зонами
+            current_collisions = []
+            if current_zones and _levels_data.get(key):
+                current_collisions = check_collisions(_levels_data[key], current_zones, curr_price)
+                _collisions_data[key] = current_collisions
+            
+            # C) Отправляем сообщения для STF
+            
+            # 1. Отправляем уровни (если нужно)
+            if should_send_levels:
+                ok = await _send_levels_message(
+                    tg, symbol, tf, candles, current_levels, curr_price,
+                    rsi14, emas, ema_analysis, pats, trend_info, breakout_description
+                )
+                if ok:
+                    _last_state[key] = state
+                    _last_sent_candle_ts[key] = curr_ts
+                    _last_price[key] = curr_price
+                    _wait_new_candle[key] = False
+                    sent_messages += 1
+                    logging.info("[STF] Уровни отправлены для %s/%s", symbol, tf)
+            
+            # 2. Отправляем маржинальные зоны (если есть и изменились)
+            zones_state = _zones_signature(current_zones)
+            if current_zones and _last_zones_state.get(key) != zones_state:
+                ok = await _send_zones_message(tg, symbol, tf, current_zones, curr_price)
+                if ok:
+                    _last_zones_state[key] = zones_state
+                    sent_messages += 1
+                    logging.info("[STF] Зоны отправлены для %s/%s", symbol, tf)
+            
+            # 3. Отправляем совпадения (если есть и изменились)
+            collisions_state = _collisions_signature(current_collisions)
+            if current_collisions and _last_collisions_state.get(key) != collisions_state:
+                ok = await _send_collisions_message(tg, symbol, tf, current_collisions, curr_price)
+                if ok:
+                    _last_collisions_state[key] = collisions_state
+                    sent_messages += 1
+                    logging.info("[STF] Совпадения отправлены для %s/%s", symbol, tf)
+        
+        # Обновляем цену
+        _last_price[key] = curr_price
+        
+        return sent_messages > 0
         
     except Exception as e:
         logging.error("[ERROR] %s/%s: %s", symbol, tf, e)
@@ -596,13 +857,15 @@ async def run_symbol_tf(
 
 async def main_loop() -> None:
     """Основной цикл бота."""
-    global _last_banner_ts, _margin_integrator
+    global _last_banner_ts
     
     logging.info("=" * 60)
     logging.info("🚀 Бот запускается...")
     logging.info(f"Python: {sys.version}")
     logging.info(f"Working Directory: {os.getcwd()}")
     logging.info(f"MarginZone доступен: {MARGINZONE_AVAILABLE}")
+    logging.info(f"MTF таймфреймы: {MTF_GROUP}")
+    logging.info(f"STF таймфреймы: {STF_GROUP}")
     logging.info("=" * 60)
     
     # Инициализируем Telegram бота
@@ -624,33 +887,6 @@ async def main_loop() -> None:
         import traceback
         logging.error(traceback.format_exc())
         return
-    
-    # Инициализируем MarginZoneIntegrator (если доступен)
-    if MARGINZONE_AVAILABLE:
-        try:
-            _margin_integrator = MarginZoneIntegrator(telegram_client=tg)
-            logging.info("✅ MarginZoneIntegrator инициализирован")
-            
-            # Добавляем символы для мониторинга MarginZone
-            for symbol, tfs in SYMBOLS_TFS.items():
-                for tf in tfs:
-                    config = MarginZoneConfig(
-                        impulse_atr_mult=1.8,
-                        zone_width_atr=0.5,
-                        max_zone_lifetime=100
-                    )
-                    _margin_integrator.add_symbol(symbol, tf, config)
-            
-            logging.info(f"✅ Добавлено {len(SYMBOLS_TFS)} символов в MarginZone")
-            
-        except Exception as e:
-            logging.error(f"❌ Ошибка инициализации MarginZoneIntegrator: {e}")
-            import traceback
-            logging.error(traceback.format_exc())
-            _margin_integrator = None
-    else:
-        logging.warning("⚠️  MarginZoneIntegrator не доступен, работаем без него")
-        _margin_integrator = None
     
     TF_SLEEP = 60
     error_count = 0
@@ -676,11 +912,12 @@ async def main_loop() -> None:
                 
                 now = time.time()
                 if sent_count > 0 and (now - _last_banner_ts) >= 1800:
-                    banner_text = "📊 <b>Market Monitor Active</b>\n"
-                    banner_text += f"Обработано пар: {len(SYMBOLS_TFS)}\n"
-                    banner_text += f"Отправлено сигналов: {sent_count}"
-                    if _margin_integrator:
-                        banner_text += f"\nMarginZone активен: {len(_margin_integrator.get_active_zones())} зон"
+                    banner_text = f"""📊 <b>Market Monitor Active</b>
+Обработано пар: {len(SYMBOLS_TFS)}
+MTF таймфреймы: {', '.join(MTF_GROUP)}
+STF таймфреймы: {', '.join(STF_GROUP)}
+Отправлено сигналов: {sent_count}
+MarginZone активен: {'Да' if MARGINZONE_AVAILABLE else 'Нет'}"""
                     
                     if await tg.send_message(banner_text):
                         _last_banner_ts = now
@@ -720,13 +957,6 @@ async def main_loop() -> None:
             logging.info("✅ HTTP сессия закрыта")
         except:
             pass
-            
-        if _margin_integrator:
-            try:
-                _margin_integrator.close()
-                logging.info("✅ MarginZoneIntegrator закрыт")
-            except:
-                pass
 
 if __name__ == "__main__":
     try:
