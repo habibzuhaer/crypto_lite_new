@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 TG - Модуль для отправки структурированных оповещений в Telegram
+с интеграцией антиспам-защиты
 """
 
 import asyncio
@@ -9,6 +10,9 @@ import os
 from typing import Optional, Dict, List, Tuple, Any
 import logging
 from datetime import datetime
+
+# Импортируем антиспам (ВНИМАНИЕ: импорт после настроек логирования)
+from utils_antispam import signal_spam
 
 # Настройка логирования
 logging.basicConfig(
@@ -95,9 +99,37 @@ class TelegramBot:
         
         return success
 
+
+# ============================================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ АНТИСПАМА
+# ============================================================================
+
+def _get_signal_key(symbol: str, tf: str, report_type: str) -> str:
+    """
+    Формирует ключ для антиспама на основе символа, таймфрейма и типа отчета.
+    Пример: "BTCUSDT_1h_levels"
+    """
+    return f"{symbol}_{tf}_{report_type}"
+
+
+def _extract_price_from_message(message: str) -> Optional[float]:
+    """
+    Пытается извлечь цену из текста сообщения для проверки изменений.
+    Ищет паттерн "Текущая цена: `12345.67`" или аналогичный.
+    """
+    import re
+    # Ищем число после "Текущая цена: `" или "💰 Текущая цена: `"
+    price_pattern = r'Текущая цена:.*?`(\d+\.?\d*)`'
+    match = re.search(price_pattern, message)
+    if match:
+        return float(match.group(1))
+    return None
+
+
 # ============================================================================
 # ОСНОВНЫЕ ФУНКЦИИ ДЛЯ ОТПРАВКИ ОПОВЕЩЕНИЙ (ИМПОРТИРУЮТСЯ В MAIN)
 # ============================================================================
+
 async def send_levels_report(symbol: str, tf: str, levels: List[float], current_price: float) -> bool:
     """
     Отправляет отчёт о рассчитанных уровнях для заданного символа и таймфрейма.
@@ -140,9 +172,24 @@ async def send_levels_report(symbol: str, tf: str, levels: List[float], current_
 ⏰ {datetime.now().strftime('%H:%M:%S')}
     """
     
+    # ===== АНТИСПАМ: проверка на дубликат =====
+    signal_key = _get_signal_key(symbol, tf, "levels")
+    
+    if signal_spam.is_duplicate_signal(signal_key, message, current_price):
+        logger.info(f"[ANTISPAM] Уровни {signal_key} заблокированы (дубликат)")
+        return False
+    
     # Отправляем сообщение
     async with TelegramBot() as bot:
-        return await bot.send_message(message)
+        success = await bot.send_message(message)
+    
+    # ===== АНТИСПАМ: запоминаем успешную отправку =====
+    if success:
+        signal_spam.remember_signal(signal_key, message, current_price)
+        logger.info(f"[ANTISPAM] Уровни {signal_key} запомнены")
+    
+    return success
+
 
 async def send_margin_zones_report(symbol: str, tf: str, zones: List[Dict[str, float]], current_price: float) -> bool:
     """
@@ -191,9 +238,24 @@ async def send_margin_zones_report(symbol: str, tf: str, zones: List[Dict[str, f
 ⏰ {datetime.now().strftime('%H:%M:%S')}
     """
     
+    # ===== АНТИСПАМ: проверка на дубликат =====
+    signal_key = _get_signal_key(symbol, tf, "margin_zones")
+    
+    if signal_spam.is_duplicate_signal(signal_key, message, current_price):
+        logger.info(f"[ANTISPAM] Маржинальные зоны {signal_key} заблокированы (дубликат)")
+        return False
+    
     # Отправляем сообщение
     async with TelegramBot() as bot:
-        return await bot.send_message(message)
+        success = await bot.send_message(message)
+    
+    # ===== АНТИСПАМ: запоминаем успешную отправку =====
+    if success:
+        signal_spam.remember_signal(signal_key, message, current_price)
+        logger.info(f"[ANTISPAM] Маржинальные зоны {signal_key} запомнены")
+    
+    return success
+
 
 async def send_collision_alert(
     symbol: str, 
@@ -247,16 +309,45 @@ async def send_collision_alert(
 ⏰ {datetime.now().strftime('%H:%M:%S')}
     """
     
-    # Отправляем сообщение
+    # ===== АНТИСПАМ: проверка на дубликат =====
+    signal_key = _get_signal_key(symbol, tf, "collision")
+    
+    # Для коллизий используем более жесткие настройки (меньше повторений)
+    # Сохраняем оригинальные настройки
+    original_cooldown = signal_spam.cooldown
+    original_max_repeats = signal_spam.max_repeats
+    
+    # Временно увеличиваем защиту для коллизий
+    signal_spam.cooldown = 600  # 10 минут вместо 5
+    signal_spam.max_repeats = 1  # Только один раз
+    
+    is_duplicate = signal_spam.is_duplicate_signal(signal_key, message, current_price)
+    
+    # Возвращаем настройки
+    signal_spam.cooldown = original_cooldown
+    signal_spam.max_repeats = original_max_repeats
+    
+    if is_duplicate:
+        logger.info(f"[ANTISPAM] Коллизия {signal_key} заблокирована (дубликат)")
+        return False
+    
+    # Отправляем сообщение (уведомление включено)
     async with TelegramBot() as bot:
-        return await bot.send_message(message, disable_notification=False)  # Уведомление включено!
+        success = await bot.send_message(message, disable_notification=False)
+    
+    # ===== АНТИСПАМ: запоминаем успешную отправку =====
+    if success:
+        signal_spam.remember_signal(signal_key, message, current_price)
+        logger.info(f"[ANTISPAM] Коллизия {signal_key} запомнена")
+    
+    return success
+
 
 async def test_bot_connection() -> bool:
     """
     Тестирование подключения к боту.
     """
     async with TelegramBot() as bot:
-        # Вместо getMe просто пытаемся отправить тестовое сообщение
         test_params = {
             "chat_id": bot.chat_id,
             "text": "🤖 Бот подключен и готов к работе!",
@@ -272,12 +363,13 @@ async def test_bot_connection() -> bool:
             logger.error("❌ Не удалось подключиться к Telegram боту")
             return False
 
+
 # ============================================================================
-# ТЕСТИРОВАНИЕ МОДУЛЯ
+# ТЕСТИРОВАНИЕ МОДУЛЯ С УЧЕТОМ АНТИСПАМА
 # ============================================================================
 async def test_all_reports():
     """Функция для тестирования всех типов оповещений."""
-    print("🧪 Тестирование модуля Telegram...")
+    print("🧪 Тестирование модуля Telegram с антиспамом...")
     
     if not await test_bot_connection():
         print("❌ Не удалось подключиться к боту")
@@ -293,16 +385,38 @@ async def test_all_reports():
         {'high': 45300.0, 'low': 45200.0, 'width': 100.0, 'strength': 0.9}
     ]
     
-    print("1. Тест отчёта об уровнях...")
-    await send_levels_report(symbol, tf, test_levels, current_price)
+    print("\n🔄 Тест 1: Отправка уровней (должна пройти)...")
+    result1 = await send_levels_report(symbol, tf, test_levels, current_price)
+    print(f"   Результат: {'✅ Успешно' if result1 else '❌ Блок'}")
+
+    print("\n🔄 Тест 2: Повторная отправка уровней (должна быть заблокирована антиспамом)...")
+    result2 = await send_levels_report(symbol, tf, test_levels, current_price)
+    print(f"   Результат: {'✅ Успешно' if result2 else '❌ Блок (ОК)'}")
     
-    print("2. Тест отчёта о маржинальных зонах...")
-    await send_margin_zones_report(symbol, tf, test_zones, current_price)
+    print("\n🔄 Тест 3: Отправка уровней с другой ценой (должна пройти)...")
+    result3 = await send_levels_report(symbol, tf, test_levels, 45100.0)  # Цена изменилась
+    print(f"   Результат: {'✅ Успешно' if result3 else '❌ Блок'}")
     
-    print("3. Тест оповещения о совпадении...")
-    await send_collision_alert(symbol, tf, 44950.0, test_zones[0], current_price)
+    print("\n🔄 Тест 4: Отправка маржинальных зон...")
+    result4 = await send_margin_zones_report(symbol, tf, test_zones, current_price)
+    print(f"   Результат: {'✅ Успешно' if result4 else '❌ Блок'}")
     
-    print("✅ Тестирование завершено")
+    print("\n🔄 Тест 5: Отправка коллизии...")
+    result5 = await send_collision_alert(symbol, tf, 44950.0, test_zones[0], current_price)
+    print(f"   Результат: {'✅ Успешно' if result5 else '❌ Блок'}")
+    
+    print("\n🔄 Тест 6: Повторная отправка коллизии (должна быть заблокирована)...")
+    result6 = await send_collision_alert(symbol, tf, 44950.0, test_zones[0], current_price)
+    print(f"   Результат: {'✅ Успешно' if result6 else '❌ Блок (ОК)'}")
+    
+    print("\n✅ Тестирование завершено")
+    
+    # Показываем статистику антиспама
+    print("\n📊 Статистика антиспама:")
+    print(f"   Всего запомнено сигналов: {len(signal_spam.sent_signals)}")
+    for key, data in signal_spam.sent_signals.items():
+        print(f"   • {key}: {data.get('count', 0)} раз(а)")
+
 
 if __name__ == "__main__":
     asyncio.run(test_all_reports())
